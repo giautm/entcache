@@ -12,6 +12,8 @@ import (
 	"entgo.io/ent/dialect/sql"
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/go-redis/redismock/v8"
+	natsserver "github.com/nats-io/nats-server/v2/test"
+	"github.com/nats-io/nats.go"
 )
 
 func TestDriver_ContextLevel(t *testing.T) {
@@ -136,6 +138,54 @@ func TestDriver_Levels(t *testing.T) {
 		rmock.ExpectGet("1").SetVal(string(buf))
 		expectQuery(context.Background(), t, drv, "SELECT active FROM users", []interface{}{true, false})
 		if err := rmock.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+		expected := entcache.Stats{Gets: 2, Hits: 1}
+		if s := drv.Stats(); s != expected {
+			t.Errorf("unexpected stats: %v != %v", s, expected)
+		}
+	})
+
+	t.Run("NATS", func(t *testing.T) {
+		opts := natsserver.DefaultTestOptions
+		opts.Port = nats.DefaultPort
+		opts.JetStream = true
+
+		s := natsserver.RunServer(&opts)
+		defer s.Shutdown()
+
+		conn, err := nats.Connect(nats.DefaultURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		js, err := conn.JetStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		kvStore, err := js.CreateKeyValue(&nats.KeyValueConfig{
+			Bucket:      "entcache",
+			Description: "Ent cache",
+			Storage:     nats.MemoryStorage,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var (
+			drv = entcache.NewDriver(
+				drv,
+				entcache.Levels(
+					entcache.NewLRU(-1),
+					entcache.NewNATS(kvStore),
+				),
+			)
+		)
+		mock.ExpectQuery("SELECT active FROM users").
+			WillReturnRows(sqlmock.NewRows([]string{"active"}).AddRow(true).AddRow(false))
+
+		expectQuery(context.Background(), t, drv, "SELECT active FROM users", []interface{}{true, false})
+		expectQuery(context.Background(), t, drv, "SELECT active FROM users", []interface{}{true, false})
+		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Fatal(err)
 		}
 		expected := entcache.Stats{Gets: 2, Hits: 1}
